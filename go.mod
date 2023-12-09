@@ -4,8 +4,11 @@ go 1.21
 
 require (
 	github.com/df-mc/dragonfly v0.9.9
+	github.com/google/uuid v1.3.0
 	github.com/paroxity/portal v1.0.13
+	github.com/patrickmn/go-cache v2.1.0+incompatible
 	github.com/sandertv/gophertunnel v1.33.0
+	github.com/sirupsen/logrus v1.9.0
 	go.uber.org/atomic v1.11.0
 )
 
@@ -18,11 +21,9 @@ require (
 	github.com/go-gl/mathgl v1.0.0 // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
-	github.com/google/uuid v1.3.0 // indirect
 	github.com/klauspost/compress v1.15.15 // indirect
 	github.com/muhammadmuzzammil1998/jsonc v1.0.0 // indirect
 	github.com/sandertv/go-raknet v1.12.0 // indirect
-	github.com/sirupsen/logrus v1.9.0 // indirect
 	golang.org/x/crypto v0.5.0 // indirect
 	golang.org/x/exp v0.0.0-20230206171751-46f607a40771 // indirect
 	golang.org/x/image v0.5.0 // indirect

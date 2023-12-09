@@ -5,12 +5,15 @@ import (
 	"encoding/binary"
 	"fmt"
 	"github.com/df-mc/dragonfly/server/player"
+	"github.com/google/uuid"
 	"github.com/paroxity/portal/socket/packet"
 	"github.com/sandertv/gophertunnel/minecraft/protocol"
+	"github.com/sirupsen/logrus"
 	"go.uber.org/atomic"
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Portal represents a client that connections to a portal proxy over a TCP socket connection.
@@ -18,7 +21,8 @@ type Portal struct {
 	address string
 	conn    net.Conn
 
-	pool packet.Pool
+	pool   packet.Pool
+	logger *logrus.Logger
 
 	sendMu sync.Mutex
 	hdr    *packet.Header
@@ -29,18 +33,23 @@ type Portal struct {
 
 	handlers map[uint16]PacketHandler
 
-	authResponseHandler       *AuthResponseHandler
-	serverListResponseHandler *ServerListResponseHandler
+	authResponseHandler        *AuthResponseHandler
+	transferResponseHandler    *TransferResponseHandler
+	serverListResponseHandler  *ServerListResponseHandler
+	playerInfoResponseHandler  *PlayerInfoResponseHandler
+	findPlayerResponseHandler  *FindPlayerResponseHandler
+	updatePlayerLatencyHandler *UpdatePlayerLatencyHandler
 }
 
 // New returns a new portal client and attempts to connect to the proxy's socket connection on the provided added.
-func New(address string) (*Portal, error) {
+func New(address string, log *logrus.Logger) (*Portal, error) {
 	portal := &Portal{
 		address: address,
 
-		pool: packet.NewPool(),
-		buf:  bytes.NewBuffer(make([]byte, 0, 4096)),
-		hdr:  &packet.Header{},
+		pool:   packet.NewPool(),
+		logger: log,
+		buf:    bytes.NewBuffer(make([]byte, 0, 4096)),
+		hdr:    &packet.Header{},
 
 		handlers: make(map[uint16]PacketHandler),
 	}
@@ -56,7 +65,7 @@ func New(address string) (*Portal, error) {
 func (portal *Portal) connect() error {
 	conn, err := net.Dial("tcp", portal.address)
 	if err != nil {
-		return nil
+		return err
 	}
 	portal.conn = conn
 	portal.name.Store("")
@@ -68,13 +77,21 @@ func (portal *Portal) connect() error {
 func (portal *Portal) registerHandlers() {
 	portal.authResponseHandler = &AuthResponseHandler{}
 	portal.serverListResponseHandler = &ServerListResponseHandler{}
+	portal.transferResponseHandler = &TransferResponseHandler{}
+	portal.playerInfoResponseHandler = &PlayerInfoResponseHandler{}
+	portal.findPlayerResponseHandler = &FindPlayerResponseHandler{}
+	portal.updatePlayerLatencyHandler = NewUpdatePlayerLatencyHandler(time.Minute, time.Minute*5)
 
-	portal.RegisterPacketHandler(packet.IDAuthResponse, portal.authResponseHandler)
-	portal.RegisterPacketHandler(packet.IDServerListResponse, portal.serverListResponseHandler)
+	portal.registerPacketHandler(packet.IDAuthResponse, portal.authResponseHandler)
+	portal.registerPacketHandler(packet.IDServerListResponse, portal.serverListResponseHandler)
+	portal.registerPacketHandler(packet.IDTransferResponse, portal.transferResponseHandler)
+	portal.registerPacketHandler(packet.IDPlayerInfoResponse, portal.playerInfoResponseHandler)
+	portal.registerPacketHandler(packet.IDFindPlayerResponse, portal.findPlayerResponseHandler)
+	portal.registerPacketHandler(packet.IDUpdatePlayerLatency, portal.updatePlayerLatencyHandler)
 }
 
-// RegisterPacketHandler registers the provided packet handler for the provided packet ID.
-func (portal *Portal) RegisterPacketHandler(id uint16, handler PacketHandler) {
+// registerPacketHandler registers the provided packet handler for the provided packet ID.
+func (portal *Portal) registerPacketHandler(id uint16, handler PacketHandler) {
 	portal.handlers[id] = handler
 }
 
@@ -142,37 +159,62 @@ func (portal *Portal) Run() error {
 			if containsAny(err.Error(), "EOF", "closed") {
 				return nil
 			}
-			fmt.Printf("failed to read packet from socket connection: %v\n", err)
+			portal.logger.Warnf("failed to read packet from socket connection: %v\n", err)
 			continue
 		}
 
 		h, ok := portal.handlers[pk.ID()]
 		if ok {
 			if err := h.Handle(pk, portal); err != nil {
-				fmt.Printf("failed to handle packet from socket connection: %v\n", err)
+				portal.logger.Warnf("failed to handle packet from socket connection: %v\n", err)
 			}
 		} else {
-			fmt.Printf("unhandled packet %T from socket connection: %v\n", pk, err)
+			portal.logger.Debugf("unhandled packet %T from socket connection: %v\n", pk, err)
 		}
 	}
 }
 
 // Transfer sends a transfer request to portal, requesting to transfer the player to the server with the provided name.
-func (portal *Portal) Transfer(p *player.Player, server string) error {
-	return portal.WritePacket(&packet.TransferRequest{
-		PlayerUUID: p.UUID(),
-		Server:     server,
-	})
+// The returned byte is the response status from the transfer. The possible values for this can be found above packet.TransferResponse.
+func (portal *Portal) Transfer(p *player.Player, server string) (byte, error) {
+	handler := portal.transferResponseHandler
+	if handler.waitChan == nil {
+		if err := portal.WritePacket(&packet.TransferRequest{
+			PlayerUUID: p.UUID(),
+			Server:     server,
+		}); err != nil {
+			return packet.TransferResponseError, err
+		}
+		handler.waitChan = make(chan struct{}, 1)
+	}
+	select {
+	case <-handler.waitChan:
+		return handler.responseStatus, handler.err
+	}
 }
 
-// TODO: PlayerInfo returns the information of the player provided. This information includes their IP address and their XUID.
+// PlayerInfo returns the information of the player provided. This information includes their IP address and their XUID.
+func (portal *Portal) PlayerInfo(p *player.Player) (*PlayerInfoResponse, error) {
+	handler := portal.playerInfoResponseHandler
+	if handler.waitChan == nil {
+		if err := portal.WritePacket(&packet.PlayerInfoRequest{
+			PlayerUUID: p.UUID(),
+		}); err != nil {
+			return nil, err
+		}
+		handler.waitChan = make(chan struct{}, 1)
+	}
+	select {
+	case <-handler.waitChan:
+		return handler.response, handler.err
+	}
+}
 
 // ServerList returns a list of servers that are registered to the connected portal.
 func (portal *Portal) ServerList() ([]packet.ServerEntry, error) {
 	handler := portal.serverListResponseHandler
-	if handler.waitChan != nil {
-		err := portal.WritePacket(&packet.ServerListRequest{})
-		if err != nil {
+	if handler.waitChan == nil {
+		if err := portal.WritePacket(&packet.ServerListRequest{}); err != nil {
 			return nil, err
 		}
 		handler.waitChan = make(chan struct{}, 1)
@@ -183,10 +225,40 @@ func (portal *Portal) ServerList() ([]packet.ServerEntry, error) {
 	}
 }
 
-// TODO: FindPlayer returns the name of the server the player is connected to. If they are not connected to portal, an empty
+// FindPlayerFromName returns the name of the server the player is connected to. If they are not connected to portal, an empty
 // string and false will be returned.
+func (portal *Portal) FindPlayerFromName(playerName string) (string, error) {
+	return portal.findPlayer(&packet.FindPlayerRequest{PlayerName: playerName})
+}
 
-// TODO: PlayerLatency returns the latency of the player provided.
+// FindPlayerFromUUID returns the name of the server the player is connected to. If they are not connected to portal, an empty
+// string and false will be returned.
+func (portal *Portal) FindPlayerFromUUID(playerUuid uuid.UUID) (string, error) {
+	return portal.findPlayer(&packet.FindPlayerRequest{PlayerUUID: playerUuid})
+}
+
+// ...
+func (portal *Portal) findPlayer(request *packet.FindPlayerRequest) (string, error) {
+	handler := portal.findPlayerResponseHandler
+	if handler.waitChan == nil {
+		if err := portal.WritePacket(request); err != nil {
+			return "", err
+		}
+		handler.waitChan = make(chan struct{}, 1)
+	}
+	select {
+	case <-handler.waitChan:
+		return handler.response, handler.err
+	}
+}
+
+// PlayerLatency returns the latency of the player provided.
+func (portal *Portal) PlayerLatency(p *player.Player) int64 {
+	if latency, ok := portal.updatePlayerLatencyHandler.cache.Get(p.UUID().String()); ok {
+		return latency.(int64)
+	}
+	return -1
+}
 
 // ReadPacket reads a packet from the connection and returns it. The client is expected to prefix the packet payload
 // with 4 bytes for the length of the payload.

@@ -16,6 +16,7 @@ func (h *ServerListResponseHandler) Handle(p packet.Packet, _ *Portal) error {
 	h.servers = pk.Servers
 	if h.waitChan != nil {
 		close(h.waitChan)
+		h.waitChan = nil
 	}
 	return nil
 }
