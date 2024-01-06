@@ -1,4 +1,4 @@
-module github.com/twistedasylummc/portaldf
+module github.com/twistedasylummc/portal-df
 
 go 1.21
 
